@@ -138,62 +138,6 @@ true (evaluates to 1)
 
 false (evaluates to 0)
 
-## 🎮 Recommended Usage Pattern
-
-```csharp
-public class GameSystem : MonoBehaviour
-{
-    private FormulaParser parser;
-    private readonly HashSet<string> dirtyFormulas = new();
-    private const int MAX_UPDATES_PER_FRAME = 50;
-    
-    void Start()
-    {
-        parser = new FormulaParser();
-        
-        // Register all formulas at initialization
-        parser.RegisterFormula("player_damage", "base_damage * strength");
-        parser.RegisterFormula("enemy_defense", "base_defense * (1 + armor * 0.1)");
-        parser.RegisterFormula("final_damage", 
-            "max(0, player_damage - enemy_defense)");
-    }
-    
-    void Update()
-    {
-        // Mark formulas as dirty when parameters change
-        if (Input.GetKeyDown(KeyCode.Space))
-        {
-            dirtyFormulas.Add("player_damage");
-            dirtyFormulas.Add("final_damage");
-        }
-        
-        // Process limited number of updates per frame
-        UpdateFormulas();
-    }
-    
-    void UpdateFormulas()
-    {
-        int processed = 0;
-        foreach (var formula in dirtyFormulas.ToArray())
-        {
-            if (processed >= MAX_UPDATES_PER_FRAME)
-                break;
-                
-            // Force cache update
-            parser.RemoveCacheFor(formula);
-            float value = parser.EvaluateByName(formula);
-            
-            dirtyFormulas.Remove(formula);
-            processed++;
-        }
-    }
-    
-    void OnDestroy()
-    {
-        parser?.Dispose();
-    }
-}
-```
 ## ⚠️ Common Mistakes to Avoid
 ❌ DON'T use Evaluate() in Update() for the same expression
 
