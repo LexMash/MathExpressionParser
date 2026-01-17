@@ -228,3 +228,5 @@ Parameter providers: Use delegates for dynamic values
 Memory: Parser implements IDisposable - always dispose properly
 
 Frame budget: Stay under 50 formula updates per frame
+
+### MIT License. Free for commercial and personal use.
