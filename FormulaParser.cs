@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using UnityEngine;
 using UnityEngine.Pool;
@@ -15,148 +17,189 @@ public class FormulaParser : IDisposable
     private const string True = "true";
     private const string False = "false";
 
-    public class Function
-    {
-        public readonly int ArgumentsAmount;
-        public readonly Func<float[], float> Method;
+    // Precomputed data for fast comparison
+    private static readonly byte[] precedences = new byte[] { 1, 1, 2, 2, 2, 3, 0, 0 };
+    private static readonly bool[] rightAssociative = new bool[] { false, false, false, false, false, true, false, false };
 
-        public Function(int argumentsAmount, Func<float[], float> method)
+    private static readonly bool[] IsOperatorLookup = CreateOperatorLookup();
+
+    private static bool[] CreateOperatorLookup()
+    {
+        var lookup = new bool[128]; // For ASCII characters
+        lookup['+'] = true;
+        lookup['-'] = true;
+        lookup['*'] = true;
+        lookup['/'] = true;
+        lookup['%'] = true;
+        lookup['^'] = true;
+        lookup['&'] = true;
+        lookup['|'] = true;
+        return lookup;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsOperatorChar(char c)
+    {
+        // O(1) access, no branching besides bounds check
+        return c < IsOperatorLookup.Length && IsOperatorLookup[c];
+    }
+
+    public readonly struct Function
+    {
+        public readonly Func<float[], float> Method;
+        public readonly byte ArgumentsAmount;
+
+        public Function(byte argumentsAmount, Func<float[], float> method)
         {
             ArgumentsAmount = argumentsAmount;
             Method = method;
         }
     }
 
-    public class Operation
+    public enum OperationType : byte
     {
-        public readonly string Symbol;
-        public readonly int Precedence;
-        public readonly bool RightAssociative;
-        private readonly Func<float, float, float> func;
-
-        public Operation(string symbol, int precedence, bool rightAssociative, Func<float, float, float> func)
-        {
-            Symbol = symbol;
-            Precedence = precedence;
-            RightAssociative = rightAssociative;
-            this.func = func;
-        }
-
-        public float Perform(float a , float b) => func(a, b);
+        Add,        // +
+        Subtract,   // -
+        Multiply,   // *
+        Divide,     // /
+        Modulo,     // %
+        Power,      // ^
+        And,        // &
+        Or,         // |
     }
 
-    private readonly Dictionary<string, Func<float>> parameterProviders = new();
-    private readonly Dictionary<string, Token[]> formulaCache = new();
-    private readonly HashSet<string> formulaNames = new(128);
-    private readonly Dictionary<string, float> formulasResultCache = new();
+    public readonly struct OperationData
+    {
+        public readonly byte Precedence;
+        public readonly OperationType Type;
+        public readonly bool RightAssociative;
+
+        public OperationData(OperationType type, byte precedence, bool rightAssociative)
+        {
+            Type = type;
+            Precedence = precedence;
+            RightAssociative = rightAssociative;
+        }
+    }
+
+    private readonly Dictionary<char, OperationType> operationsMap = new()
+    {
+        {'+', OperationType.Add },
+        {'-', OperationType.Subtract },
+        {'*', OperationType.Multiply },
+        {'/', OperationType.Divide },
+        {'%', OperationType.Modulo },
+        {'^', OperationType.Power },
+        {'&', OperationType.And },
+        {'|', OperationType.Or },
+    };
+
+    private readonly Dictionary<int, Func<float>> parameterProviders = new();
+    private readonly Dictionary<int, Token[]> formulaCache = new();
+    private readonly HashSet<int> formulaNames = new(128);
+    private readonly Dictionary<int, float> formulasResultCache = new();
     private readonly ObjectPool<List<Token>> tokenListPool = new(() => new List<Token>(32), list => list.Clear(), actionOnDestroy: list => list.Clear(), collectionCheck: false, defaultCapacity: 4);
     private readonly ObjectPool<float[]> argsCachePool = new(() => new float[16], collectionCheck: false, defaultCapacity: 4);
+    private readonly ObjectPool<Stack<float>> stackFloatPool = new(() => new Stack<float>(16), stack => stack.Clear(), actionOnDestroy: stack => stack.Clear(), collectionCheck: false, defaultCapacity: 4);
+    private readonly ObjectPool<Stack<Token>> stackTokenPool = new(() => new Stack<Token>(16), stack => stack.Clear(), actionOnDestroy: stack => stack.Clear(), collectionCheck: false, defaultCapacity: 4);
 
-    // Математические функции
-    private static readonly Dictionary<string, Function> functions = new()
+    // Mathematical functions
+    private readonly Dictionary<int, Function> functions = new()
     {
-        {"sin", new (argumentsAmount: 1, method: args => (float)Math.Sin(args[0]))},
-        {"cos", new (1, args => (float)Math.Cos(args[0]))},
-        {"tan", new (1, args =>(float) Math.Tan(args[0]))},
-        {"sqrt", new (1, args => (float)Math.Sqrt(args[0]))},
-        {"abs", new (1, args => Math.Abs(args[0]))},
-        {"min", new (2, args => Math.Min(args[0], args[1]))},
-        {"max", new (2, args => Math.Max(args[0], args[1]))},
-        {"pow", new (2, args => (float)Mathf.Pow(args[0], args[1]))},
-        {"clamp", new (3, args => Math.Clamp(args[0], args[1], args[2]))},
-        {"lerp", new (3, args => args[0] + (args[1] - args[0]) * args[2])},
-        {"floor", new (1, args => (float)Math.Floor(args[0]))},
-        {"ceil", new (1, args => (float)Math.Ceiling(args[0]))},
-        {"round", new (1, args => (float)Math.Round(args[0]))},
+        {"sin".GetHashCode(), new (argumentsAmount: 1, method: args => (float)Math.Sin(args[0]))},
+        {"cos".GetHashCode(), new (1, args => (float)Math.Cos(args[0]))},
+        {"tan".GetHashCode(), new (1, args =>(float) Math.Tan(args[0]))},
+        {"sqrt".GetHashCode(), new (1, args => (float)Math.Sqrt(args[0]))},
+        {"abs".GetHashCode(), new (1, args => Math.Abs(args[0]))},
+        {"min".GetHashCode(), new (2, args => Math.Min(args[0], args[1]))},
+        {"max".GetHashCode(), new (2, args => Math.Max(args[0], args[1]))},
+        {"pow".GetHashCode(), new (2, args => (float)Mathf.Pow(args[0], args[1]))},
+        {"clamp".GetHashCode(), new (3, args => Math.Clamp(args[0], args[1], args[2]))},
+        {"lerp".GetHashCode(), new (3, args => args[0] + (args[1] - args[0]) * args[2])},
+        {"floor".GetHashCode(), new (1, args => (float)Math.Floor(args[0]))},
+        {"ceil".GetHashCode(), new (1, args => (float)Math.Ceiling(args[0]))},
+        {"round".GetHashCode(), new (1, args => (float)Math.Round(args[0]))},
 
-        {"and", new (2, args => (args[0] != 0 && args[1] != 0) ? 1f : 0f)},
-        {"or", new (2, args => (args[0] != 0 || args[1] != 0) ? 1f : 0f)},
-        {"not", new (1, args => (args[0] == 0) ? 1f : 0f)},
-        {"xor", new (2, args => (args[0] != 0 ^ args[1] != 0) ? 1f : 0f)},
-    
-        {"eq", new (2, args => Math.Abs(args[0] - args[1]) < 0.00001f ? 1f : 0f)}, //equal
-        {"neq", new (2, args => Math.Abs(args[0] - args[1]) > 0.00001f ? 1f : 0f)}, //not equal
-        {"gt", new (2, args => args[0] > args[1] ? 1f : 0f)}, //greater then
-        {"lt", new (2, args => args[0] < args[1] ? 1f : 0f)}, //less then
-        {"gte", new (2, args => args[0] >= args[1] ? 1f : 0f)}, //greater or equal
-        {"lte", new (2, args => args[0] <= args[1] ? 1f : 0f)}, //less or equal
-        {"if", new (3, args => args[0] != 0 ? args[1] : args[2])},
+        {"and".GetHashCode(), new (2, args => (args[0] != 0 && args[1] != 0) ? 1f : 0f)},
+        {"or".GetHashCode(), new (2, args => (args[0] != 0 || args[1] != 0) ? 1f : 0f)},
+        {"not".GetHashCode(), new (1, args => (args[0] == 0) ? 1f : 0f)},
+        {"xor".GetHashCode(), new (2, args => (args[0] != 0 ^ args[1] != 0) ? 1f : 0f)},
+
+        {"eq".GetHashCode(), new (2, args => Math.Abs(args[0] - args[1]) < 0.00001f ? 1f : 0f)}, //equal
+        {"neq".GetHashCode(), new (2, args => Math.Abs(args[0] - args[1]) > 0.00001f ? 1f : 0f)}, //not equal
+        {"gt".GetHashCode(), new (2, args => args[0] > args[1] ? 1f : 0f)}, //greater then
+        {"lt".GetHashCode(), new (2, args => args[0] < args[1] ? 1f : 0f)}, //less then
+        {"gte".GetHashCode(), new (2, args => args[0] >= args[1] ? 1f : 0f)}, //greater or equal
+        {"lte".GetHashCode(), new (2, args => args[0] <= args[1] ? 1f : 0f)}, //less or equal
+        {"if".GetHashCode(), new (3, args => args[0] != 0 ? args[1] : args[2])},
     };
 
-    private static readonly Dictionary<string, Operation> operationsMap = new()
-    {
-        {"+", new Operation("+", 1, false, (a, b) => a + b) },
-        {"-", new Operation("-", 1, false, (a, b) => a - b) },
-        {"*", new Operation("*", 2, false, (a, b) => a * b) },
-        {"/", new Operation("/", 2, false, (a, b) => b != 0 ? a / b : float.NaN) },
-        {"%", new Operation("%", 2, false, (a, b) => b != 0 ? a % b : float.NaN) },
-        {"^", new Operation("^", 3, true, (a, b) => (float)Math.Pow(a, b)) },
-        {"&", new Operation("&", 0, false, (a, b) => (a != 0 && b != 0) ? 1 : 0) },
-        {"|", new Operation("|", 0, false, (a, b) => (a != 0 || b != 0) ? 1 : 0) },
-    };
-
-    // Регистрация провайдеров параметров
     public void RegisterParameter(string name, Func<float> provider)
     {
         if (string.IsNullOrEmpty(name))
-            throw new ArgumentException("Имя параметра не может быть пустым");
+            throw new ArgumentException("Parameter name cannot be empty");
 
-        parameterProviders[name] = provider;
+        parameterProviders[name.GetHashCode()] = provider;
+    }
+
+    public float GetParameterValue(string name)
+    {
+        if (parameterProviders.TryGetValue(name.GetHashCode(), out var func))
+            return func();
+
+        throw new ArgumentException("Parameter name is not registered");
     }
 
     public void RegisterParameter(string name, float value) => RegisterParameter(name, () => value);
-    public bool UnregisterParameter(string name) => parameterProviders.Remove(name);
+    public bool UnregisterParameter(string name) => parameterProviders.Remove(name.GetHashCode());
 
-    // Регистрация формул
     public void RegisterFormula(string name, string formula)
     {
         if (string.IsNullOrEmpty(name))
-            throw new ArgumentException("Имя формулы не может быть пустым");
+            throw new ArgumentException("Formula name cannot be empty");
 
         if (string.IsNullOrEmpty(formula))
-            throw new ArgumentException("Формула не может быть пустой");
+            throw new ArgumentException("Formula cannot be empty");
 
-        // Проверяем валидность формулы
-        formulaNames.Add(name);
-        formulaCache[name] = ConvertToRPN(Tokenize(formula));
+        var hash = name.GetHashCode();
+
+        if (formulaNames.Contains(hash))
+            throw new ArgumentException("Formula with this name is already registered");
+
+        formulaNames.Add(hash);
+        formulaCache[hash] = ConvertToRPN(Tokenize(formula));
     }
 
     public bool TryUnregisterFormula(string name)
     {
-        if (formulaNames.Contains(name))
+        var hash = name.GetHashCode();
+
+        if (formulaNames.Contains(hash))
         {
-            formulaNames.Remove(name);
-            formulaCache.Remove(name);
+            formulaNames.Remove(hash);
+            formulaCache.Remove(hash);
             return true;
         }
-        
+
         return false;
     }
 
-    // Основной метод вычисления
     public float Evaluate(string expression)
     {
-        if(formulasResultCache.TryGetValue(expression, out var result))
-            return result;
-
         try
         {
-            var tokens = Tokenize(expression);
-            return EvaluateRPN(ConvertToRPN(tokens));
+            return EvaluateRPN(ConvertToRPN(Tokenize(expression))); ;
         }
         catch (Exception ex)
         {
-            throw new Exception($"Ошибка вычисления выражения: {expression}\n{ex.Message}");
+            throw new Exception($"Error evaluating expression: {expression}\n{ex.Message}");
         }
     }
 
     public float EvaluateWithCaching(string expression)
     {
-        if(!formulasResultCache.TryGetValue(expression, out var result))
-        {
-            result = Evaluate(expression);
-            formulasResultCache[expression] = result;
-        }
+        var result = Evaluate(expression);
+        formulasResultCache[expression.GetHashCode()] = result;
 
         return result;
     }
@@ -164,57 +207,62 @@ public class FormulaParser : IDisposable
     /// <summary>
     /// Can be used for the name of an expression or formula
     /// </summary>
-    /// <param name="value"></param>
-    public void RemoveCacheFor(string value)
+    /// <param name="nameOrExpression"></param>
+    public void RemoveCacheFor(string nameOrExpression)
     {
-        if(formulasResultCache.ContainsKey(value))
-            formulasResultCache.Remove(value);
+        var hash = nameOrExpression.GetHashCode();
+
+        if (formulasResultCache.ContainsKey(hash))
+            formulasResultCache.Remove(hash);
     }
 
     public float EvaluateByName(string formulaName)
     {
-        if (formulasResultCache.TryGetValue(formulaName, out var result))
+        var hash = formulaName.GetHashCode();
+
+        if (formulasResultCache.TryGetValue(hash, out var result))
             return result;
 
-        if (formulaCache.TryGetValue(formulaName, out var rpnTokens))
+        if (formulaCache.TryGetValue(hash, out var rpnTokens))
             return EvaluateRPN(rpnTokens);
 
-        throw new KeyNotFoundException($"Формула '{formulaName}' не найдена");
+        throw new KeyNotFoundException($"Formula '{formulaName}' not found");
     }
 
     public float EvaluateByNameWithCaching(string formulaName)
     {
-        if(!formulasResultCache.TryGetValue(formulaName, out var result))
-        {
-            result = EvaluateByName(formulaName);
-            formulasResultCache[formulaName] = result;
-        }
+        var result = EvaluateByName(formulaName);
+        formulasResultCache[formulaName.GetHashCode()] = result;
 
         return result;
     }
 
     public void ClearCache()
     {
-        formulaNames.Clear();
         formulaCache.Clear();
+        formulasResultCache.Clear();
     }
 
     public void ClearAll()
     {
         parameterProviders.Clear();
-        formulaCache.Clear();
         formulaNames.Clear();
+        ClearCache();
     }
 
     public void Dispose()
     {
         tokenListPool.Clear();
         tokenListPool.Dispose();
+        argsCachePool.Clear();
+        argsCachePool.Dispose();
+        operationsMap.Clear();
+        functions.Clear();
+
         ClearAll();
     }
 
-    //private List<Token> Tokenize(string expression)
-    public List<Token> Tokenize(string expression)
+    private List<Token> Tokenize(string expression)
     {
         List<Token> tokens = tokenListPool.Get();
         int position = 0;
@@ -224,7 +272,7 @@ public class FormulaParser : IDisposable
         {
             char current = expression[position];
 
-            if (char.IsDigit(current) || current == Dot)
+            if (IsDigit(current) || current == Dot)
             {
                 tokens.Add(ReadNumber(expression, ref position));
             }
@@ -232,17 +280,17 @@ public class FormulaParser : IDisposable
             {
                 tokens.Add(ReadIdentifier(expression, ref position));
             }
-            else if (IsOperator(current.ToString()))
+            else if (IsOperatorChar(current))
             {
                 if (current == Minus &&
-                    position + 1 < length && 
-                    char.IsDigit(expression[position + 1]))
+                    position + 1 < length &&
+                    IsDigit(expression[position + 1]))
                 {
                     tokens.Add(ReadNumber(expression, ref position));
                 }
                 else
                 {
-                    tokens.Add(new Token(TokenType.Operator, current.ToString()));
+                    tokens.Add(new Token(TokenType.Operator, operationsMap[current]));
                     position++;
                 }
             }
@@ -285,7 +333,7 @@ public class FormulaParser : IDisposable
         {
             char current = expression[position];
 
-            if(char.IsDigit(current))
+            if (IsDigit(current))
             {
                 position++;
             }
@@ -300,7 +348,7 @@ public class FormulaParser : IDisposable
             }
         }
 
-        ReadOnlySpan<char> stringValue = expression.AsSpan(startPosition, position - startPosition);  
+        ReadOnlySpan<char> stringValue = expression.AsSpan(startPosition, position - startPosition);
         float.TryParse(stringValue, NumberStyles.Any, CultureInfo.InvariantCulture, out var numericValue);
         return new Token(TokenType.Number, numericValue);
     }
@@ -324,21 +372,23 @@ public class FormulaParser : IDisposable
 
         string value = expression[startPosition..position];
 
-        if (value.Equals(True, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(value, True, StringComparison.OrdinalIgnoreCase))
             return CommonTokens.True;
 
-        if (value.Equals(False, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(value, False, StringComparison.OrdinalIgnoreCase))
             return CommonTokens.False;
 
-        // Проверяем, является ли это функцией
-        if (position < expression.Length && 
-            expression[position] == LeftParenthesis && 
-            functions.ContainsKey(value))
+        var hash = value.GetHashCode();
+
+        // Check if it's a function
+        if (position < expression.Length &&
+            expression[position] == LeftParenthesis &&
+            functions.ContainsKey(hash))
         {
             return new Token(TokenType.Function, value);
         }
 
-        if (formulaNames.Contains(value))
+        if (formulaNames.Contains(hash))
         {
             return new Token(TokenType.Formula, value);
         }
@@ -346,14 +396,10 @@ public class FormulaParser : IDisposable
         return new Token(TokenType.Identifier, value);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool IsOperator(string op) => operationsMap.ContainsKey(op);
-
-    //private Token[] ConvertToRPN(List<Token> tokens)
-    public Token[] ConvertToRPN(List<Token> tokens)
+    private Token[] ConvertToRPN(List<Token> tokens)
     {
         var output = tokenListPool.Get();
-        var stack = new Stack<Token>(32);
+        var stack = stackTokenPool.Get();
         var count = tokens.Count;
         for (int i = 0; i < count; i++)
         {
@@ -375,14 +421,10 @@ public class FormulaParser : IDisposable
                 case TokenType.Operator:
                     while (stack.Count > 0 && stack.Peek().Type == TokenType.Operator)
                     {
-                        Operation op1 = operationsMap[token.Value];
-                        Operation op2 = operationsMap[stack.Peek().Value];
-                        int op1Precendence = op1.Precedence;
-                        int op2Precendence = op2.Precedence;
-                        bool op1RightAssociative = op1.RightAssociative;                  
+                        OperationType op1Type = token.Operation;
+                        OperationType op2Type = stack.Peek().Operation;
 
-                        if (op1Precendence < op2Precendence || 
-                            !op1RightAssociative && op1Precendence == op2Precendence)
+                        if (ShouldPopOperator(op1Type, op2Type))
                         {
                             output.Add(stack.Pop());
                         }
@@ -401,9 +443,9 @@ public class FormulaParser : IDisposable
                     }
 
                     if (stack.Count == 0 || stack.Peek().Type != TokenType.LeftParenthesis)
-                        throw new Exception("Несбалансированные скобки");
+                        throw new Exception("Unbalanced parentheses");
 
-                    stack.Pop(); // Убираем левую скобку
+                    stack.Pop(); // Remove left parenthesis
 
                     if (stack.Count > 0 && stack.Peek().Type == TokenType.Function)
                     {
@@ -423,22 +465,22 @@ public class FormulaParser : IDisposable
         while (stack.Count > 0)
         {
             if (stack.Peek().Type == TokenType.LeftParenthesis)
-                throw new Exception("Несбалансированные скобки");
+                throw new Exception("Unbalanced parentheses");
 
             output.Add(stack.Pop());
         }
 
+        stackTokenPool.Release(stack);
         tokenListPool.Release(tokens);
         Token[] array = output.ToArray();
         tokenListPool.Release(output);
         return array;
     }
 
-    //private float EvaluateRPN(Token[] rpnTokens)
-    public float EvaluateRPN(Token[] rpnTokens)
+    private float EvaluateRPN(Token[] rpnTokens)
     {
         var argsCache = argsCachePool.Get();
-        var stack = new Stack<float>(32);
+        var stack = stackFloatPool.Get();
         for (int i = 0; i < rpnTokens.Length; i++)
         {
             ref Token token = ref rpnTokens[i];
@@ -450,66 +492,95 @@ public class FormulaParser : IDisposable
                     break;
 
                 case TokenType.Identifier:
-                    if (parameterProviders.TryGetValue(token.Value, out var provider))
+                    if (parameterProviders.TryGetValue(token.StringValue.GetHashCode(), out var provider))
                     {
                         stack.Push(provider());
                     }
                     else
                     {
-                        throw new Exception($"Неизвестный параметр: '{token.Value}'");
+                        throw new Exception($"Unknown parameter: '{token.StringValue}'");
                     }
                     break;
 
                 case TokenType.Operator:
                     if (stack.Count < 2)
                     {
-                        var op = token.Value;
+                        var op = token.Operation;
                         var a = stack.Pop();
-                        if (op.Equals("-"))
+                        if (op == OperationType.Subtract)
                             stack.Push(-a);
                         else
-                            throw new Exception("Недостаточно операндов для оператора");
+                            throw new Exception("Not enough operands for operator");
                     }
                     else
                     {
                         float b = stack.Pop();
                         float a = stack.Pop();
-                        var value = PreformOperation(token.Value, a, b);
+                        var value = PreformOperation(token.Operation, a, b);
                         stack.Push(value);
                     }
                     break;
 
                 case TokenType.Function:
-                    if (!functions.TryGetValue(token.Value, out var func))
-                        throw new Exception($"Неизвестная функция: '{token.Value}'");
+                    if (!functions.TryGetValue(token.StringValue.GetHashCode(), out var func))
+                        throw new Exception($"Unknown function: '{token.StringValue}'");
 
-                    // Собираем аргументы функции
+                    // Collect function arguments
                     var count = func.ArgumentsAmount;
                     for (int k = count - 1; k >= 0; k--)
                     {
                         argsCache[k] = stack.Pop();
                     }
 
-                    float result = func.Method(argsCache);
-                    stack.Push(result);
+                    stack.Push(func.Method(argsCache));
                     break;
 
                 case TokenType.Formula:
-                    stack.Push(EvaluateByName(token.Value));
+                    var res = EvaluateByName(token.StringValue);
+                    stack.Push(res);
                     break;
 
                 default:
-                    throw new Exception($"Неожиданный токен: {token.Type}");
+                    throw new Exception($"Unexpected token: {token.Type}");
             }
         }
 
         if (stack.Count != 1)
-            throw new Exception("Некорректное выражение");
+            throw new Exception("Invalid expression");
 
         argsCachePool.Release(argsCache);
-        return stack.Pop();
+        float result = stack.Pop();
+        stackFloatPool.Release(stack);
+        return result;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private float PreformOperation(string op, float a, float b) => operationsMap[op].Perform(a, b);
+    private float PreformOperation(OperationType operation, float a, float b)
+    {
+        return operation switch
+        {
+            OperationType.Add => a + b,
+            OperationType.Subtract => a - b,
+            OperationType.Multiply => a * b,
+            OperationType.Divide => b != 0 ? a / b : float.NaN,
+            OperationType.Modulo => b != 0 ? a % b : float.NaN,
+            OperationType.Power => (float)Math.Pow(a, b),
+            OperationType.And => (a != 0 && b != 0) ? 1 : 0,
+            OperationType.Or => (a != 0 || b != 0) ? 1 : 0,
+            _ => 0f,
+        };
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool ShouldPopOperator(OperationType current, OperationType next)
+    {
+        int precCurrent = precedences[(int)current];
+        int precStack = precedences[(int)next];
+        bool isRightAssoc = rightAssociative[(int)current];
+
+        return precCurrent < precStack || (!isRightAssoc && precCurrent == precStack);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool IsDigit(char c) => c >= '0' && c <= '9';
 }
