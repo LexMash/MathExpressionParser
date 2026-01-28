@@ -1,6 +1,8 @@
 using System;
+using static FormulaParser;
+using static UnityEngine.Rendering.DebugUI;
 
-public enum TokenType
+public enum TokenType : byte
 {
     Number,
     Boolean,
@@ -24,14 +26,16 @@ public readonly struct Token
     public static readonly Token False = new(TokenType.Boolean, "false", false);
 
     public readonly TokenType Type;
-    public readonly string Value;
-    public readonly float NumericValue;
+    public readonly OperationType Operation;
     public readonly bool BooleanValue;
+    public readonly float NumericValue;
+    public readonly string StringValue;
 
     public Token(TokenType type, float numericValue)
     {
         Type = type;
-        Value = null;
+        Operation = default;
+        StringValue = null;
         NumericValue = numericValue;
         BooleanValue = false;
     }
@@ -39,7 +43,17 @@ public readonly struct Token
     public Token(TokenType type, string value)
     {
         Type = type;
-        Value = value;
+        Operation = default;
+        StringValue = value;
+        NumericValue = 0;
+        BooleanValue = false;
+    }
+
+    public Token(TokenType type, OperationType operation)
+    {
+        Type = type;
+        Operation = operation;
+        StringValue = null;
         NumericValue = 0;
         BooleanValue = false;
     }
@@ -47,12 +61,13 @@ public readonly struct Token
     public Token(TokenType type, string value, bool booleanValue)
     {
         Type = type;
-        Value = value;
+        Operation = default;
+        StringValue = value;
         NumericValue = booleanValue ? 1 : 0;
         BooleanValue = booleanValue;
     }
 
-    public override string ToString() => $"{Type}: {Value}";
+    public override string ToString() => $"{Type}: {StringValue}";
 }
 
 public static class CommonTokens
