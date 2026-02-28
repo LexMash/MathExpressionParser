@@ -51,8 +51,10 @@ parser.RegisterParameter("current_time", () => Time.time);
 
 // Remove parameter
 parser.UnregisterParameter("param_name");
+```
+
 Formula Management
-csharp
+```csharp
 // Register formula (parsing cached)
 parser.RegisterFormula("formula_name", "expression");
 
@@ -70,8 +72,10 @@ float result = parser.Evaluate("10 + sin(time) * 5");
 
 // With result caching
 float cached = parser.EvaluateWithCaching("10 + sin(time) * 5");
+```
+
 Cache Management
-csharp
+```csharp
 // Remove specific cache entry
 parser.RemoveCacheFor("formula_name");
 
@@ -93,6 +97,7 @@ parser.ClearCache();
 // Clear everything (parameters, formulas, caches)
 parser.ClearAll();
 ```
+
 ## 🔧 Supported Operations
 ### Arithmetic Operators
 
